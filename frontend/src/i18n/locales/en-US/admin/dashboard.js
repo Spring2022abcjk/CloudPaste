@@ -3,6 +3,9 @@ export default {
     systemOverview: "System Overview",
     refresh: "Refresh",
     refreshing: "Refreshing...",
+    refreshStorage: "Refresh Storage",
+    refreshingStorage: "Refreshing...",
+    refreshStorageTooltip: "Recalculate usage snapshots for all storage configurations",
     fetchError: "Failed to fetch data",
     loading: "Loading...",
     error: "Loading failed",
@@ -11,13 +14,13 @@ export default {
     totalPastes: "Text Shares",
     totalFiles: "File Uploads",
     totalApiKeys: "API Keys",
-    totalS3Configs: "S3 Configs",
+    totalStorageConfigs: "Storage Configs",
     totalStorageUsed: "Storage Used",
 
     // Cache monitoring
     cacheMonitoring: "Cache Monitoring",
     directoryCache: "Directory Cache",
-    s3UrlCache: "S3 URL Cache",
+    urlCache: "URL Cache",
     searchCache: "Search Cache",
     hitRate: "Hit Rate",
     cacheItems: "Cache Items",
@@ -25,12 +28,50 @@ export default {
     clearAllCache: "Clear All Cache",
 
     // Storage related
-    storageUsage: "Storage Usage",
-    allBuckets: "All Buckets",
-    selectBucket: "Select Bucket",
+    storageUsage: "Storage Usage (Used/Limit)",
+    storageConfigs: "Storage Configurations",
+    noStorageConfigs: "No storage configurations",
+    allStorages: "All Storages",
+    selectStorage: "Select Storage",
     usagePercent: "Usage",
     availableStorage: "Available Storage",
     usedStorage: "Used Storage",
+    remaining: "Remaining",
+    total: "Total",
+    used: "Used",
+    available: "Available",
+    unlimited: "Unlimited",
+    configs: " configs",
+    exceeded: "Exceeded",
+
+    // Storage details
+    showDetails: "Show Details",
+    hideDetails: "Hide Details",
+    providerQuota: "Provider Usage (Total/Used)",
+    quotaSnapshot: "Quota Snapshot",
+    snapshotInfo: "Snapshot Info",
+    snapshotTime: "Last snapshot",
+    latestSnapshot: "Latest snapshot",
+    clickToViewList: "Click to view list",
+    totalItems: "{count} items",
+
+    // Source labels
+    sourceLabels: {
+      provider: "Provider",
+      localFs: "Disk Scan",
+      vfsNodes: "VFS Nodes",
+      fsIndex: "File Index",
+      unknown: "Unknown",
+    },
+
+    // Source descriptions
+    sourceDescriptions: {
+      provider: "Data from storage driver's native quota API",
+      localFs: "Calculated by scanning local disk directory",
+      vfsNodes: "Based on virtual file system node statistics",
+      fsIndex: "Based on file index records",
+    },
+
     storageUnits: {
       bytes: "Bytes",
       kb: "KB",
@@ -64,13 +105,8 @@ export default {
     timeAgo: "{time} ago",
     justNow: "Just now",
 
-    // Storage providers
-    providers: {
-      cloudflareR2: "Cloudflare R2",
-      backblazeB2: "Backblaze B2",
-      awsS3: "AWS S3",
-      other: "Other Providers",
-    },
+    // Storage types
+    storageTypeDistribution: "Storage Type Distribution",
 
     // Status information
     status: {
@@ -93,14 +129,10 @@ export default {
     serverEnvironment: "Server Environment",
     dataStorage: "Data Storage",
 
-    // Storage bucket distribution
-    storageBucketDistribution: "Storage Bucket Distribution",
-    otherStorage: "Other Storage",
-
     // Tips and messages
     tips: {
       noApiKeys: "No API keys created yet",
-      noS3Configs: "No S3 storage configured yet",
+      noStorageConfigs: "No storage configuration yet",
       noActivity: "No recent activity",
       lowStorage: "Low storage space",
     },

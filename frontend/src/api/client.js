@@ -5,48 +5,63 @@
 
 import { getFullApiUrl } from "./config";
 import { ApiStatus } from "./ApiStatus"; // 导入API状态码常量
+import { logoutViaBridge, buildAuthHeaders } from "@/modules/security/index.js";
+import { enqueueOfflineOperation } from "@/modules/pwa-offline/index.js";
+import { createLogger } from "@/utils/logger.js";
+import { useOnline } from "@vueuse/core";
 
-/**
- * 获取离线操作类型
- * @param {string} endpoint - API端点
- * @param {string} method - HTTP方法
- * @returns {Object|null} 操作类型信息或null（如果不支持离线）
- */
-function getOfflineOperationType(endpoint, method) {
-  // 文本分享操作
-  if (endpoint.includes("/paste") && method === "POST") {
-    return { type: "createPaste", description: "离线创建文本分享已加入队列" };
+const isOnline = useOnline();
+
+const apiLog = createLogger("API");
+
+// - 优先使用后端返回的 message
+// - 附带请求ID（X-Request-Id）方便排查
+function extractRequestIdFromResponse(response) {
+  try {
+    return response?.headers?.get("X-Request-Id") || response?.headers?.get("x-request-id") || null;
+  } catch {
+    return null;
   }
+}
 
-  // 统一文本分享操作
-  if (endpoint.includes("/pastes/")) {
-    if (method === "PUT") return { type: "updatePaste", description: "离线更新文本分享已加入队列" };
+function isGenericServerErrorMessage(message) {
+  const text = String(message || "").trim();
+  if (!text) return true;
+  return (
+    text === "服务器内部错误" ||
+    text === "内部错误" ||
+    text === "请求失败" ||
+    text === "未知错误" ||
+    text.includes("服务器内部错误") ||
+    text.includes("内部错误")
+  );
+}
+
+function appendRequestIdIfNeeded(message, requestId) {
+  const text = String(message || "").trim();
+  const rid = String(requestId || "").trim();
+  if (!rid) return text;
+  // 只在提示过于泛化时追加 requestId，避免正常业务错误变得很长
+  if (!isGenericServerErrorMessage(text)) return text;
+  return `${text}（请求ID:${rid}）`;
+}
+
+function appendDebugInfoIfNeeded(message, { requestId, debugMessage } = {}) {
+  const text = String(message || "").trim();
+  if (!isGenericServerErrorMessage(text)) return text;
+
+  const parts = [];
+  const rid = String(requestId || "").trim();
+  if (debugMessage) {
+    const reason = String(debugMessage).replace(/\s+/g, " ").trim();
+    if (reason) {
+      const clipped = reason.length > 160 ? `${reason.slice(0, 159)}…` : reason;
+      parts.push(`原因:${clipped}`);
+    }
   }
-
-  if (endpoint.includes("/pastes/batch-delete") && method === "DELETE") {
-    return { type: "batchDeletePastes", description: "离线批量删除文本分享已加入队列" };
-  }
-
-  if (endpoint.includes("/pastes/clear-expired") && method === "POST") {
-    return { type: "clearExpiredPastes", description: "离线清理过期文本分享已加入队列" };
-  }
-
-  // 系统管理操作
-  if (endpoint.includes("/admin/settings/group/") && method === "PUT") {
-    return { type: "updateGroupSettings", description: "离线分组设置更新已加入队列" };
-  }
-
-  if (endpoint.includes("/admin/cache/clear") && method === "POST") {
-    return { type: "clearCache", description: "离线缓存清理已加入队列" };
-  }
-
-  // 文件密码验证
-  if (endpoint.includes("/public/files/") && endpoint.includes("/verify") && method === "POST") {
-    return { type: "verifyFilePassword", description: "离线文件密码验证已加入队列" };
-  }
-
-  // 不支持的操作类型
-  return null;
+  if (rid) parts.push(`请求ID:${rid}`);
+  if (!parts.length) return text;
+  return `${text}（${parts.join("，")}）`;
 }
 
 /**
@@ -59,18 +74,20 @@ function checkPasswordRelatedRequest(endpoint, options) {
   // 判断是否是密码验证请求（文本或文件分享的密码验证）
   const isTextPasswordVerify = endpoint.match(/^(\/)?paste\/[a-zA-Z0-9_-]+$/i) && options.method === "POST";
   const isFilePasswordVerify = endpoint.match(/^(\/)?public\/files\/[a-zA-Z0-9_-]+\/verify$/i) && options.method === "POST";
+  const isFsMetaPasswordVerify = endpoint.includes("/fs/meta/password/verify") && options.method === "POST";
   const hasPasswordInBody = options.body && (typeof options.body === "string" ? options.body.includes("password") : options.body.password);
 
   // 检查是否是修改密码请求
   const isChangePasswordRequest = endpoint.includes("/admin/change-password") && options.method === "POST";
 
-  const isPasswordVerify = (isTextPasswordVerify || isFilePasswordVerify) && hasPasswordInBody;
+  const isPasswordVerify = (isTextPasswordVerify || isFilePasswordVerify || isFsMetaPasswordVerify) && hasPasswordInBody;
 
   return {
     isPasswordVerify,
     isChangePasswordRequest,
     isTextPasswordVerify,
     isFilePasswordVerify,
+    isFsMetaPasswordVerify,
     hasPasswordInBody,
   };
 }
@@ -81,42 +98,19 @@ function checkPasswordRelatedRequest(endpoint, options) {
  * @returns {Promise<Object>} 添加了令牌的请求头
  */
 async function addAuthToken(headers) {
-  // 如果请求头中已有Authorization，优先使用传入的值
+  const merged = buildAuthHeaders(headers);
+
   if (headers.Authorization) {
-    console.log("使用传入的Authorization头:", headers.Authorization);
-    return headers;
+    apiLog.debug("请求已携带 Authorization（来自调用方）");
+  } else if (merged.Authorization) {
+    apiLog.debug("请求已携带 Authorization（来自 authBridge）");
+  } else {
+    apiLog.debug("请求未携带 Authorization");
   }
 
-  try {
-    // 尝试从认证Store获取认证信息
-    // 注意：这里需要动态导入，因为可能存在循环依赖
-    const { useAuthStore } = await import("@/stores/authStore.js");
-    const authStore = useAuthStore();
-
-    // 检查管理员认证
-    if (authStore.authType === "admin" && authStore.adminToken) {
-      console.log("从认证Store获取admin_token，长度:", authStore.adminToken.length);
-      return {
-        ...headers,
-        Authorization: `Bearer ${authStore.adminToken}`,
-      };
-    }
-
-    // 检查API密钥认证（即使isAuthenticated还未设置为true）
-    if (authStore.authType === "apikey" && authStore.apiKey) {
-      console.log("从认证Store获取API密钥，长度:", authStore.apiKey.length);
-      return {
-        ...headers,
-        Authorization: `ApiKey ${authStore.apiKey}`,
-      };
-    }
-  } catch (error) {
-    console.error("无法从认证Store获取认证信息:", error);
-  }
-
-  console.log("未找到认证凭据，请求将不包含Authorization头");
-  return headers;
+  return merged;
 }
+
 
 /**
  * 通用API请求方法
@@ -166,14 +160,16 @@ export async function fetchApi(endpoint, options = {}) {
     timestamp: new Date().toISOString(),
   };
 
-  console.log(`🚀 API请求: ${debugInfo.method} ${debugInfo.url}`, debugInfo);
+  apiLog.debug(`API请求: ${debugInfo.method} ${debugInfo.url}`, {
+    hasBody: !!debugInfo.body,
+    headerKeys: Object.keys(debugInfo.headers || {}),
+  });
 
-  // 🎯 PWA网络状态检测 - 符合最佳实践
-  if (!navigator.onLine) {
-    console.warn(`🔌 离线状态，API请求可能失败: ${url}`);
-    // Service Worker Cache API会处理HTTP缓存，这里处理离线操作队列
+  // PWA网络状态检测 - 符合最佳实践
+  if (!isOnline.value) {
+    apiLog.warn("离线状态，API请求可能失败:", url);
     if (options.method && options.method !== "GET") {
-      await handleOfflineOperation(endpoint, options);
+      await enqueueOfflineOperation(endpoint, options);
     }
   }
 
@@ -230,27 +226,47 @@ export async function fetchApi(endpoint, options = {}) {
     const endTime = Date.now();
     const timeTaken = endTime - startTime;
 
-    console.log(`⏱️ API响应耗时: ${timeTaken}ms, 状态: ${response.status}`, {
+    apiLog.debug(`API响应耗时: ${timeTaken}ms, 状态: ${response.status}`, {
       url,
       status: response.status,
       statusText: response.statusText,
-      headers: Object.fromEntries([...response.headers.entries()]),
     });
+
+    // 304 Not Modified：成熟项目常用的条件请求语义（If-None-Match）
+    // - 304 无响应体，不应尝试解析 JSON
+    // - 交由上层用本地缓存数据兜底
+    if (response.status === 304) {
+      const etag = response.headers.get("etag") || response.headers.get("ETag") || null;
+      apiLog.debug(`API响应: 304 Not Modified`, { url, etag });
+      return {
+        success: true,
+        notModified: true,
+        status: 304,
+        etag,
+        data: null,
+      };
+    }
 
     // 首先解析响应内容
     let responseData;
     const contentType = response.headers.get("content-type");
+    const requestId = extractRequestIdFromResponse(response);
 
     // 检查是否需要返回blob响应
     if (options.responseType === "blob") {
       responseData = await response.blob();
-      console.log(`📦 API响应Blob(${url}): ${responseData.size} 字节, 类型: ${responseData.type}`);
+      apiLog.debug(`API响应Blob: ${responseData.size} 字节`, { url, type: responseData.type });
     } else if (contentType && contentType.includes("application/json")) {
       responseData = await response.json();
-      console.log(`📦 API响应数据(${url}):`, responseData);
+      apiLog.debug(`API响应JSON`, {
+        url,
+        kind: Array.isArray(responseData) ? "array" : typeof responseData,
+        keys: responseData && typeof responseData === "object" && !Array.isArray(responseData) ? Object.keys(responseData).slice(0, 20) : undefined,
+        length: Array.isArray(responseData) ? responseData.length : undefined,
+      });
     } else {
       responseData = await response.text();
-      console.log(`📝 API响应文本(${url}): ${responseData.substring(0, 100)}${responseData.length > 100 ? "..." : ""}`);
+      apiLog.debug(`API响应文本: ${responseData.substring(0, 100)}${responseData.length > 100 ? "..." : ""}`);
     }
 
     // 如果响应不成功，抛出错误
@@ -269,7 +285,7 @@ export async function fetchApi(endpoint, options = {}) {
 
       // 特殊处理401未授权错误
       if (response.status === ApiStatus.UNAUTHORIZED) {
-        console.error(`🚫 授权失败(${url}):`, responseData);
+        apiLog.error(`🚫 授权失败(${url}):`, responseData);
 
         // 检查特殊的密码验证请求类型
         const isPasswordRelatedRequest = checkPasswordRelatedRequest(endpoint, options);
@@ -277,12 +293,14 @@ export async function fetchApi(endpoint, options = {}) {
 
         // 如果是密码验证请求，直接返回错误，不清除令牌
         if (isPasswordVerify) {
-          console.log(`密码验证失败，不清除认证令牌。端点: ${endpoint}`);
+          apiLog.debug(`密码验证失败：不清除认证令牌（端点: ${endpoint}）`);
 
           // 确保返回后端提供的具体错误信息
           const errorMessage = responseData && responseData.message ? responseData.message : "密码错误";
 
-          throw new Error(errorMessage);
+          const error = new Error(errorMessage);
+          error.__logged = true;
+          throw error;
         }
 
         // 如果是修改密码请求，可能是当前密码验证失败
@@ -290,89 +308,185 @@ export async function fetchApi(endpoint, options = {}) {
           // 返回具体的错误信息，通常是"当前密码错误"
           const errorMessage = responseData && responseData.message ? responseData.message : "验证失败";
 
-          throw new Error(errorMessage);
+          const error = new Error(errorMessage);
+          error.__logged = true;
+          throw error;
         }
 
         // 判断使用的是哪种认证方式
         const authHeader = requestOptions.headers.Authorization || "";
+        const errorCode =
+          responseData && typeof responseData === "object" && typeof responseData.code === "string"
+            ? responseData.code
+            : "";
 
-        // 使用认证Store处理认证失败
-        try {
-          const { useAuthStore } = await import("@/stores/authStore.js");
-          const authStore = useAuthStore();
+        const isAuthErrorCode =
+          errorCode === "UNAUTHORIZED" ||
+          errorCode === "AUTH_ERROR" ||
+          errorCode === "AUTHENTICATION_ERROR" ||
+          errorCode === "AUTH_INVALID" ||
+          errorCode === "AUTH_EXPIRED";
 
-          // 管理员令牌过期
-          if (authHeader.startsWith("Bearer ")) {
-            console.log("管理员令牌验证失败，执行登出");
-            await authStore.logout();
-            throw new Error("管理员会话已过期，请重新登录");
+        // 管理员令牌过期
+        if (authHeader.startsWith("Bearer ")) {
+          // 仅在明确的认证错误场景下才执行登出：
+          // - 后端返回的 code 表明是认证问题
+          // - 或请求命中了 /admin 登录态相关接口
+          const isAdminAuthEndpoint = endpoint.startsWith("/admin") || endpoint.includes("/admin/");
+
+          if (isAuthErrorCode || isAdminAuthEndpoint) {
+            apiLog.debug("管理员令牌验证失败：执行登出");
+            await logoutViaBridge();
+            const error = new Error("管理员会话已过期，请重新登录");
+            error.__logged = true;
+            throw error;
           }
-          // API密钥处理
-          else if (authHeader.startsWith("ApiKey ")) {
-            // 检查是否是权限不足问题（而非API密钥无效）
-            const isPermissionIssue =
-              responseData &&
-              responseData.message &&
-              (responseData.message.includes("未授权访问") ||
-                responseData.message.includes("无权访问") ||
-                responseData.message.includes("需要管理员权限或有效的API密钥") ||
-                responseData.message.includes("权限不足") ||
-                responseData.message.includes("没有权限"));
 
-            if (isPermissionIssue) {
-              // 权限不足，仅抛出错误，但不清除API密钥
-              console.log("API密钥权限不足，不执行登出");
-              throw new Error(responseData.message || "访问被拒绝，您可能无权执行此操作");
-            } else {
-              // 其他情况（如密钥真的无效）时，执行登出
-              console.log("API密钥验证失败，执行登出");
-              await authStore.logout();
-              throw new Error("API密钥无效或已过期");
-            }
-          } else {
-            throw new Error("未授权访问，请登录后重试");
-          }
-        } catch (storeError) {
-          console.error("无法使用认证Store处理认证失败:", storeError);
-          throw new Error("认证失败，请重新登录");
+          // 对于非认证类 401（例如存储驱动或业务错误），保留会话，仅抛出业务错误
+          const errorMessage =
+            responseData && typeof responseData === "object" && responseData.message
+              ? responseData.message
+              : "请求未授权，但当前管理员会话仍保持，请检查配置或稍后重试";
+
+          const error = new Error(errorMessage);
+          error.__logged = true;
+          throw error;
         }
+
+        // API密钥处理
+        if (authHeader.startsWith("ApiKey ")) {
+          const isPermissionIssue =
+            responseData &&
+            responseData.message &&
+            (responseData.message.includes("未授权访问") ||
+              responseData.message.includes("无权访问") ||
+              responseData.message.includes("需要管理员权限或有效的API密钥") ||
+              responseData.message.includes("权限不足") ||
+              responseData.message.includes("没有权限"));
+
+          if (isPermissionIssue) {
+            apiLog.debug("API密钥权限不足：不执行登出");
+            const error = new Error(responseData.message || "访问被拒绝，您可能无权执行此操作");
+            error.__logged = true;
+            throw error;
+          }
+
+          apiLog.debug("API密钥验证失败：执行登出");
+          await logoutViaBridge();
+          const apiKeyError = new Error("API密钥无效或已过期");
+          apiKeyError.__logged = true;
+          throw apiKeyError;
+        }
+
+        const unauthorizedError = new Error("未授权访问，请登录后重试");
+        unauthorizedError.__logged = true;
+        throw unauthorizedError;
       }
 
       // 对409状态码做特殊处理（链接后缀冲突或其他冲突）
       if (response.status === ApiStatus.CONFLICT) {
-        console.error(`❌ 资源冲突错误(${url}):`, responseData);
+        apiLog.error(`❌ 资源冲突错误(${url}):`, responseData);
         // 使用后端返回的具体错误信息，无论是字符串形式还是对象形式
         if (typeof responseData === "string") {
-          throw new Error(responseData);
+          const error = new Error(responseData);
+          error.__logged = true;
+          throw error;
         } else if (responseData && typeof responseData === "object" && responseData.message) {
-          throw new Error(responseData.message);
+          const error = new Error(responseData.message);
+          error.__logged = true;
+          throw error;
         } else {
-          throw new Error("链接后缀已被占用，请尝试其他后缀");
+          const error = new Error("链接后缀已被占用，请尝试其他后缀");
+          error.__logged = true;
+          throw error;
         }
       }
 
       // 处理新的后端错误格式 (code, message)
       if (responseData && typeof responseData === "object") {
-        console.error(`❌ API错误(${url}):`, responseData);
-        throw new Error(responseData.message || `HTTP错误 ${response.status}: ${response.statusText}`);
+        apiLog.error(`❌ API错误(${url}):`, responseData);
+        const baseMessage = responseData.message || `HTTP错误 ${response.status}: ${response.statusText}`;
+        const payloadRequestId =
+          typeof responseData.requestId === "string" && responseData.requestId.trim()
+            ? responseData.requestId.trim()
+            : requestId;
+        const debugMessage = typeof responseData.debugMessage === "string" ? responseData.debugMessage : null;
+        const error = new Error(appendDebugInfoIfNeeded(baseMessage, { requestId: payloadRequestId, debugMessage }));
+        error.__logged = true;
+        if (responseData.code) {
+          error.code = responseData.code;
+        }
+        if (Object.prototype.hasOwnProperty.call(responseData, "data")) {
+          error.data = responseData.data;
+        }
+        if (payloadRequestId) {
+          error.requestId = payloadRequestId;
+        }
+        if (debugMessage) {
+          error.debugMessage = debugMessage;
+        }
+        throw error;
       }
 
-      console.error(`❌ HTTP错误(${url}): ${response.status}`, responseData);
-      throw new Error(`HTTP错误 ${response.status}: ${response.statusText}`);
+      apiLog.error(`❌ HTTP错误(${url}): ${response.status}`, responseData);
+      const error = new Error(appendRequestIdIfNeeded(`HTTP错误 ${response.status}: ${response.statusText}`, requestId));
+      error.__logged = true;
+      if (requestId) {
+        error.requestId = requestId;
+      }
+      throw error;
     }
 
     // 处理新的后端统一响应格式 (code, message, data)
     if (responseData && typeof responseData === "object") {
-      // 如果响应包含code字段
-      if ("code" in responseData) {
-        // 成功响应，code应该是200、201(创建成功)或202(部分成功)
-        if (responseData.code !== ApiStatus.SUCCESS && responseData.code !== ApiStatus.CREATED && responseData.code !== ApiStatus.ACCEPTED) {
-          console.error(`❌ API业务错误(${url}):`, responseData);
-          throw new Error(responseData.message || "请求失败");
+      // success 布尔判断
+      if ("success" in responseData) {
+        if (responseData.success !== true) {
+          apiLog.error(`❌ API业务错误(${url}):`, responseData);
+          const baseMessage = responseData.message || "请求失败";
+          const payloadRequestId =
+            typeof responseData.requestId === "string" && responseData.requestId.trim()
+              ? responseData.requestId.trim()
+              : requestId;
+          const debugMessage = typeof responseData.debugMessage === "string" ? responseData.debugMessage : null;
+          const error = new Error(appendDebugInfoIfNeeded(baseMessage, { requestId: payloadRequestId, debugMessage }));
+          error.__logged = true;
+          if (responseData.code) {
+            error.code = responseData.code;
+          }
+          if (payloadRequestId) {
+            error.requestId = payloadRequestId;
+          }
+          if (debugMessage) {
+            error.debugMessage = debugMessage;
+          }
+          throw error;
         }
-
-        // 如果成功，返回完整的responseData
         return responseData;
+      }
+
+      // 兼容旧接口：HTTP 200 但 payload 的 code 表示失败（例如 code=500）
+      if (
+        typeof responseData.code === "number" &&
+        responseData.code >= 400 &&
+        responseData.message &&
+        responseData.success !== true
+      ) {
+        const payloadRequestId =
+          typeof responseData.requestId === "string" && responseData.requestId.trim()
+            ? responseData.requestId.trim()
+            : requestId;
+        const debugMessage = typeof responseData.debugMessage === "string" ? responseData.debugMessage : null;
+        const error = new Error(appendDebugInfoIfNeeded(responseData.message, { requestId: payloadRequestId, debugMessage }));
+        error.__logged = true;
+        error.code = responseData.code;
+        if (payloadRequestId) {
+          error.requestId = payloadRequestId;
+        }
+        if (debugMessage) {
+          error.debugMessage = debugMessage;
+        }
+        throw error;
       }
 
       // 如果响应不包含code字段，直接返回整个响应
@@ -387,17 +501,30 @@ export async function fetchApi(endpoint, options = {}) {
   } catch (error) {
     // 处理不同类型的错误
     if (error.name === "AbortError") {
-      console.warn(`⏹️ API请求被取消(${url}):`, error.message);
-      throw new Error("请求被取消或超时");
+      // 请求被主动取消时，静默处理，不抛出错误
+      apiLog.debug(`API请求被取消(${url})`);
+      // 创建一个特殊的 AbortError 对象，让调用方可以识别
+      const abortError = new Error("请求已取消");
+      abortError.name = "AbortError";
+      abortError.__aborted = true;
+      abortError.__logged = true;
+      throw abortError;
     } else if (error.name === "TimeoutError") {
-      console.error(`⏰ API请求超时(${url}):`, error.message);
+      apiLog.error(`⏰ API请求超时(${url}):`, error.message);
       throw new Error("请求超时，服务器响应时间过长");
     } else if (error.name === "TypeError" && error.message.includes("fetch")) {
-      console.error(`🌐 网络错误(${url}):`, error.message);
+      apiLog.error(`🌐 网络错误(${url}):`, error.message);
       throw new Error("网络连接失败，请检查网络设置");
     } else {
-      console.error(`❌ API请求失败(${url}):`, error);
-      throw error;
+      // 避免对已经在上层记录过的业务错误重复打印日志
+      if (!error.__logged) {
+        apiLog.error(`❌ API请求失败(${url}):`, error);
+      }
+      // 兜底：保证抛出去的一定是 Error，避免上层拿不到 error.message 而只能显示“未知错误”
+      if (error instanceof Error) {
+        throw error;
+      }
+      throw new Error(String(error ?? "未知错误"));
     }
   }
 }
@@ -406,81 +533,6 @@ export async function fetchApi(endpoint, options = {}) {
 let offlineOperationLock = false;
 
 // 处理离线操作（PWA
-async function handleOfflineOperation(endpoint, options) {
-  if (offlineOperationLock) {
-    console.log("[PWA] 离线操作正在处理中，跳过重复操作");
-    return;
-  }
-
-  console.log(`[PWA] 处理离线操作: ${options.method} ${endpoint}`);
-  try {
-    offlineOperationLock = true;
-
-    const { pwaUtils } = await import("../pwa/pwaManager.js");
-    if (!pwaUtils || !pwaUtils.storage) {
-      console.warn("[PWA] pwaUtils或storage不可用");
-      return;
-    }
-
-    // 获取当前认证信息
-    let authToken = null;
-    let authType = null;
-
-    try {
-      const { useAuthStore } = await import("@/stores/authStore.js");
-      const authStore = useAuthStore();
-
-      if (authStore.authType === "admin" && authStore.adminToken) {
-        authToken = authStore.adminToken;
-        authType = "admin";
-        console.log(`[PWA] 获取管理员认证信息，token长度: ${authToken.length}`);
-      } else if (authStore.authType === "apikey" && authStore.apiKey) {
-        authToken = authStore.apiKey;
-        authType = "apikey";
-        console.log(`[PWA] 获取API密钥认证信息，token长度: ${authToken.length}`);
-      }
-    } catch (error) {
-      console.error("[PWA] 获取认证信息失败:", error);
-    }
-
-    const operation = {
-      endpoint,
-      method: options.method,
-      data: options.body,
-      authToken, // 保存认证token
-      authType, // 保存认证类型
-      timestamp: new Date().toISOString(),
-      status: "pending",
-    };
-
-    // 根据端点和方法确定操作类型
-    const operationType = getOfflineOperationType(endpoint, options.method);
-    if (!operationType) {
-      console.log(`[PWA] 跳过离线操作（不适合离线处理）: ${options.method} ${endpoint}`);
-      return;
-    }
-
-    operation.type = operationType.type;
-    await pwaUtils.storage.addToOfflineQueue(operation);
-    console.log(`[PWA] ${operationType.description}`);
-
-    // 尝试注册Background Sync以确保可靠同步
-    if (pwaUtils.isBackgroundSyncSupported()) {
-      try {
-        await pwaUtils.registerBackgroundSync("sync-offline-queue");
-        console.log("[PWA] Background Sync 已注册，操作将在网络恢复时自动同步");
-      } catch (error) {
-        console.warn("[PWA] Background Sync 注册失败:", error);
-      }
-    }
-  } catch (error) {
-    console.warn("[PWA] 离线操作处理失败:", error);
-  } finally {
-    // 确保锁被释放
-    offlineOperationLock = false;
-  }
-}
-
 // 处理成功响应的业务数据存储（PWA离线）
 async function handleSuccessfulResponse(endpoint, options, responseData) {
   try {
@@ -493,19 +545,19 @@ async function handleSuccessfulResponse(endpoint, options, responseData) {
     if (method === "POST" && endpoint.includes("/paste") && responseData.data) {
       // 存储新创建的文本分享
       await pwaUtils.storage.savePaste(responseData.data);
-      console.log(`[PWA] 已存储文本分享: ${responseData.data.slug}`);
+      apiLog.debug(`[PWA] 已存储文本分享: ${responseData.data.slug}`);
     } else if (method === "POST" && endpoint.includes("/upload") && responseData.data) {
       // 存储上传的文件信息
       await pwaUtils.storage.saveFile(responseData.data);
-      console.log(`[PWA] 已存储文件信息: ${responseData.data.filename || responseData.data.slug}`);
+      apiLog.debug(`[PWA] 已存储文件信息: ${responseData.data.filename || responseData.data.slug}`);
     } else if (method === "POST" && endpoint.includes("/admin/settings")) {
       // 存储重要设置更新
       const settingKey = `admin_setting_${Date.now()}`;
       await pwaUtils.storage.saveSetting(settingKey, responseData);
-      console.log(`[PWA] 已存储管理员设置: ${settingKey}`);
+      apiLog.debug(`[PWA] 已存储管理员设置: ${settingKey}`);
     }
   } catch (error) {
-    console.warn("[PWA] 业务数据存储失败:", error);
+    apiLog.warn("[PWA] 业务数据存储失败:", error);
   }
 }
 
@@ -547,7 +599,7 @@ export async function post(endpoint, data, options = {}) {
         partInfo = `，分片: ${partNumber}${isLastPart ? " (最后分片)" : ""}`;
       }
 
-      console.log(`发送二进制数据到 ${url}${partInfo}，大小: ${data instanceof Blob ? data.size : data.byteLength} 字节`);
+      apiLog.debug(`发送二进制数据到 ${url}${partInfo}`, { size: data instanceof Blob ? data.size : data.byteLength });
 
       // 添加对 XHR 对象的处理，以支持取消功能
       const xhr = new XMLHttpRequest();
@@ -603,10 +655,10 @@ export async function post(endpoint, data, options = {}) {
                 responseData = xhr.response;
               }
 
-              console.log(`✅ 二进制上传请求成功 ${url}${partInfo}`);
+              apiLog.debug(`二进制上传请求成功 ${url}${partInfo}`);
               resolve(responseData);
             } catch (e) {
-              console.error(`解析响应错误: ${e.message}`);
+              apiLog.error(`解析响应错误: ${e.message}`);
               reject(new Error(`解析响应错误: ${e.message}`));
             }
           } else {
@@ -628,14 +680,14 @@ export async function post(endpoint, data, options = {}) {
               errorMsg = `HTTP错误 ${xhr.status}`;
             }
 
-            console.error(`❌ 二进制上传请求失败 ${url}${partInfo}: ${errorMsg}`);
+            apiLog.error(`❌ 二进制上传请求失败 ${url}${partInfo}: ${errorMsg}`);
             reject(new Error(errorMsg));
           }
         };
 
         // 监听网络错误
         xhr.onerror = function () {
-          console.error(`❌ 网络错误: ${url}${partInfo}`);
+          apiLog.error(`❌ 网络错误: ${url}${partInfo}`);
           reject(new Error("网络错误，请检查连接"));
         };
 
@@ -644,13 +696,13 @@ export async function post(endpoint, data, options = {}) {
 
         // 监听超时
         xhr.ontimeout = function () {
-          console.error(`❌ 请求超时: ${url}${partInfo}`);
+          apiLog.error(`❌ 请求超时: ${url}${partInfo}`);
           reject(new Error("请求超时，服务器响应时间过长"));
         };
 
         // 监听中止
         xhr.onabort = function () {
-          console.log(`⏹️ 请求已被中止: ${url}${partInfo}`);
+          apiLog.debug(`请求已被中止: ${url}${partInfo}`);
           reject(new Error("请求已被用户取消"));
         };
 
@@ -666,7 +718,7 @@ export async function post(endpoint, data, options = {}) {
       body: data,
     });
   } catch (error) {
-    console.error(`POST ${endpoint} 请求错误:`, error);
+    apiLog.error(`POST ${endpoint} 请求错误:`, error);
     throw error;
   }
 }

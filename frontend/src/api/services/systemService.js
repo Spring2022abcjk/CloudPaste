@@ -4,6 +4,9 @@
  */
 
 import { get, post, put } from "../client";
+import { createLogger } from "@/utils/logger.js";
+
+const log = createLogger("SystemService");
 
 /******************************************************************************
  * 仪表盘统计API
@@ -15,6 +18,37 @@ import { get, post, put } from "../client";
  */
 export function getDashboardStats() {
   return get("/admin/dashboard/stats");
+}
+
+/******************************************************************************
+ * 存储用量报告（管理端）
+ ******************************************************************************/
+
+/**
+ * 获取存储用量报告
+ * - 这是独立接口，不与 dashboard/stats 混用
+ * @returns {Promise<Object>}
+ */
+export function getStorageUsageReport() {
+  return get("/admin/storage-usage/report");
+}
+
+/**
+ * 主动刷新存储用量快照
+ * - 会触发后端重新计算并写入 metrics_cache
+ * - 可能会调用上游 API(取决于 enable_disk_usage 配置)
+ * - 应该由明确触发(点击刷新按钮),不在页面加载时自动调用
+ * @param {Object} options
+ * @param {number} [options.maxItems=50] - 最多刷新多少个存储配置(默认50,最大500)
+ * @returns {Promise<Object>} 刷新结果 { okCount, failCount, failures, total, refreshedAt }
+ */
+export function refreshStorageUsageSnapshots(options = {}) {
+  const params = new URLSearchParams();
+  if (options.maxItems && options.maxItems > 0) {
+    params.append("maxItems", String(Math.min(options.maxItems, 500)));
+  }
+  const qs = params.toString();
+  return post(`/admin/storage-usage/refresh${qs ? `?${qs}` : ""}`, null);
 }
 
 /******************************************************************************
@@ -33,9 +67,23 @@ export async function getMaxUploadSize() {
     }
     return 100; // 默认值
   } catch (error) {
-    console.error("获取最大上传大小失败:", error);
+    log.error("获取最大上传大小失败:", error);
     return 100; // 出错时返回默认值
   }
+}
+
+/**
+ * 获取上传进度（通用后端进度接口）
+ * @param {string} uploadId 上传ID
+ * @returns {Promise<Object>} 进度信息 { id, loaded, total, completed, path, storageType, updatedAt }
+ */
+export function getUploadProgress(uploadId) {
+  if (!uploadId) {
+    throw new Error("uploadId is required");
+  }
+  const params = new URLSearchParams();
+  params.append("upload_id", uploadId);
+  return get(`/upload/progress?${params.toString()}`);
 }
 
 /******************************************************************************
@@ -115,7 +163,7 @@ export function clearExpiredPastes() {
  * 清理目录缓存（管理员）
  * @param {Object} options - 清理选项
  * @param {string} [options.mountId] - 要清理的挂载点ID
- * @param {string} [options.s3ConfigId] - S3配置ID
+ * @param {string} [options.storageConfigId] - 存储配置ID
  * @returns {Promise<Object>} 清理结果
  */
 export function clearCacheAdmin(options = {}) {
@@ -126,7 +174,7 @@ export function clearCacheAdmin(options = {}) {
  * 清理目录缓存（API密钥用户）
  * @param {Object} options - 清理选项
  * @param {string} [options.mountId] - 要清理的挂载点ID
- * @param {string} [options.s3ConfigId] - S3配置ID
+ * @param {string} [options.storageConfigId] - 存储配置ID
  * @returns {Promise<Object>} 清理结果
  */
 export function clearCacheUser(options = {}) {
@@ -155,4 +203,16 @@ export function healthCheck() {
  */
 export function getVersionInfo() {
   return get("/version");
+}
+
+/******************************************************************************
+ * 游客模式相关 API
+ ******************************************************************************/
+
+/**
+ * 获取游客模式配置（Guest API Key）
+ * @returns {Promise<Object>} 游客配置，包含 enabled/key/permissions/basic_path 等
+ */
+export function getGuestConfig() {
+  return get("/public/guest-config");
 }
